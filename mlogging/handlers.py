@@ -1,11 +1,9 @@
 from logging import Handler
-from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
-import fcntl, time, os, codecs, string, re, types, cPickle, struct
+import fcntl, time, os, codecs, string, re, types, cPickle, struct, shutil
 from stat import ST_DEV, ST_INO, ST_MTIME
-import shutil
 
 
-class MP_StreamHandler(Handler):
+class StreamHandler_MP(Handler):
     """
     A handler class which writes logging records, appropriately formatted,
     to a stream. Note that this class does not close the stream, as
@@ -78,7 +76,7 @@ class MP_StreamHandler(Handler):
         except:
             self.handleError(record)
 
-class MP_FileHandler(MP_StreamHandler):
+class FileHandler_MP(StreamHandler_MP):
     """
     A handler class which writes formatted logging records to disk files.
     """
@@ -99,7 +97,7 @@ class MP_FileHandler(MP_StreamHandler):
             Handler.__init__(self)
             self.stream = None
         else:
-            MP_StreamHandler.__init__(self, self._open())
+            StreamHandler_MP.__init__(self, self._open())
 
     def close(self):
         """
@@ -109,7 +107,7 @@ class MP_FileHandler(MP_StreamHandler):
             self.flush()
             if hasattr(self.stream, "close"):
                 self.stream.close()
-            MP_StreamHandler.close(self)
+            StreamHandler_MP.close(self)
             self.stream = None
 
     def _open(self):
@@ -132,47 +130,20 @@ class MP_FileHandler(MP_StreamHandler):
         """
         if self.stream is None:
             self.stream = self._open()
-        MP_StreamHandler.emit(self, record)
-    
-
-class MP_BaseRotatingHandler(MP_FileHandler):
-    """
-    Base class for handlers that rotate log files at a certain point.
-    Not meant to be instantiated directly.  Instead, use RotatingFileHandler
-    or TimedRotatingFileHandler.
-    """
-    def __init__(self, filename, mode, encoding=None, delay=0):
-        """
-        Use the specified filename for streamed logging
-        """
-        if codecs is None:
-            encoding = None
-        MP_FileHandler.__init__(self, filename, mode, encoding, delay)
-        self.mode = mode
-        self.encoding = encoding
-
-    def emit(self, record):
-        """
-        Emit a record.
-
-        Output the record to the file, catering for rollover as described
-        in doRollover().
-        """
-        try:
-            if self.shouldRollover(record):
-                self.doRollover()
-            MP_FileHandler.emit(self, record)
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except:
-            self.handleError(record)
+        StreamHandler_MP.emit(self, record)
 
 
-class MP_RotatingFileHandler(MP_BaseRotatingHandler):
+class RotatingFileHandler_MP(FileHandler_MP):
     """
     Handler for logging to a set of files, which switches from one file
     to the next when the current file reaches a certain size.
     """
+    _lock_dir = '.lock'
+    if os.path.exists(_lock_dir):
+        pass
+    else:
+        os.mkdir(_lock_dir)
+    
     def __init__(self, filename, mode='a', maxBytes=0, backupCount=0, encoding=None, delay=0):
         """
         Open the specified file and use it as the stream for logging.
@@ -196,7 +167,9 @@ class MP_RotatingFileHandler(MP_BaseRotatingHandler):
         """
         if maxBytes > 0:
             mode = 'a' # doesn't make sense otherwise!
-        MP_BaseRotatingHandler.__init__(self, filename, mode, encoding, delay)
+        FileHandler_MP.__init__(self, filename, mode, encoding, delay)
+        self.mode = mode
+        self.encoding = encoding
         self.maxBytes = maxBytes
         self.backupCount = backupCount
 
@@ -243,7 +216,29 @@ class MP_RotatingFileHandler(MP_BaseRotatingHandler):
                 return 1
         return 0
     
-class MP_TimedRotatingFileHandler(MP_BaseRotatingHandler):
+    def emit(self, record):
+        """
+        Emit a record.
+
+        Output the record to the file, catering for rollover as described
+        in doRollover().
+        """
+        try:
+            if self.shouldRollover(record):
+                self.doRollover()
+            FileLock = self._lock_dir + '/' + os.path.basename(self.baseFilename) + '.' + record.levelname
+            f = open(FileLock, "w+")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            FileHandler_MP.emit(self, record)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
+    
+        
+class TimedRotatingFileHandler_MP(FileHandler_MP):
     """
     Handler for logging to a file, rotating the log file at certain timed
     intervals.
@@ -251,8 +246,16 @@ class MP_TimedRotatingFileHandler(MP_BaseRotatingHandler):
     If backupCount is > 0, when rollover is done, no more than backupCount
     files are kept - the oldest ones are deleted.
     """
+    _lock_dir = '.lock'
+    if os.path.exists(_lock_dir):
+        pass
+    else:
+        os.mkdir(_lock_dir)
+    
     def __init__(self, filename, when='h', interval=1, backupCount=0, encoding=None, delay=0, utc=0):
-        MP_BaseRotatingHandler.__init__(self, filename, 'a', encoding, delay)
+        FileHandler_MP.__init__(self, filename, 'a', encoding, delay)
+        self.mode = mode
+        self.encoding = encoding
         self.when = string.upper(when)
         self.backupCount = backupCount
         self.utc = utc
@@ -465,58 +468,25 @@ class MP_TimedRotatingFileHandler(MP_BaseRotatingHandler):
                 else:           # DST bows out before next rollover, so we need to add an hour
                     newRolloverAt = newRolloverAt + 3600
         self.rolloverAt = newRolloverAt
-        
-
-class MailHandler(Handler):
-    """
-    Mail Handler
-    send the logrecord to address via mail
-    """
-    def __init__(self, address):
-        Handler.__init__(self)
-        self.address = address
-
+    
     def emit(self, record):
-        #subject = "[" + record.levelname + "]" + " from " + socket.gethostname()
-        subject = "[" + record.levelname + "]" + " from " + "[" + record.__dict__['module_name'] \
-            + "]" + " @ " + record.__dict__['clientip']
-        context = self.format(record)
-        address = self.address
-        cmd = 'echo "%s" | mail -s "%s" "%s"' % (context, subject, address)
-        #print cmd
-        os.system(cmd)
-        
+        """
+        Emit a record.
 
-rotate_config = {}
-
-def setRotate(rotateconfig):
-    global rotate_config
-    rotate_config = rotateconfig
-
-def getRotatingHandler(filename):
-    if rotate_config['multiprocess'] == 0:
-        if rotate_config['ro_rotateby'] == 1: # by file size
-            return RotatingFileHandler(filename, maxBytes=rotate_config['ro_maxsize'], backupCount=rotate_config['ro_backupcount'], delay=True)
-        elif rotate_config['ro_rotateby'] == 2:
-            return TimedRotatingFileHandler(filename, when=rotate_config['ro_when'], interval=rotate_config['ro_interval'], backupCount=rotate_config['ro_backupcount'], delay=True)
-    else: # use by multiprocess 
-        if rotate_config['ro_rotateby'] == 1: # by file size
-            return MP_RotatingFileHandler(filename, maxBytes=rotate_config['ro_maxsize'], backupCount=rotate_config['ro_backupcount'], delay=True)
-        elif rotate_config['ro_rotateby'] == 2:
-            return MP_TimedRotatingFileHandler(filename, when=rotate_config['ro_when'], interval=rotate_config['ro_interval'], backupCount=rotate_config['ro_backupcount'], delay=True)
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
+        Output the record to the file, catering for rollover as described
+        in doRollover().
+        """
+        try:
+            if self.shouldRollover(record):
+                self.doRollover()
+            FileLock = self._lock_dir + '/' + os.path.basename(self.baseFilename) + '.' + record.levelname
+            f = open(FileLock, "w+")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            FileHandler_MP.emit(self, record)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
         
