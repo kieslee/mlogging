@@ -1,360 +1,492 @@
-import logging, inspect, socket, os
-import handlers
-from handlers import getRotatingHandler, MailHandler
-from singleton import Singleton
-from threading import Lock
-import sys, cStringIO, traceback
+from logging import Handler
+import fcntl, time, os, codecs, string, re, types, cPickle, struct, shutil
+from stat import ST_DEV, ST_INO, ST_MTIME
 
-lock_config = Lock()
 
-import fcntl
-LOCKFILE_DEBUG = ".lock/lock_file.debug"
-LOCKFILE_INFO = ".lock/lock_file.info"
-LOCKFILE_WARNING = ".lock/lock_file.warning"
-LOCKFILE_ERROR = ".lock/lock_file.error"
-LOCKFILE_CRITICAL = ".lock/lock_file.critical"
+class StreamHandler_MP(Handler):
+    """
+    A handler class which writes logging records, appropriately formatted,
+    to a stream. Note that this class does not close the stream, as
+    sys.stdout or sys.stderr may be used.
+    """
 
-############### ucmlogging module ###############
-class ucmlogging(Singleton):
-    # some global variables
-    level_list = ('debug', 'info', 'warning', 'error', 'critical')
-    logger_list = {'debug': logging.getLogger('ucmlogging.debug'),
-                    'info': logging.getLogger('ucmlogging.info'),
-                    'warning': logging.getLogger('ucmlogging.warning'),
-                    'error': logging.getLogger('ucmlogging.error'),
-                    'critical': logging.getLogger('ucmlogging.critical')
-    }
-    handler_list = {}
-    mail_handler = None
-    lock = Lock()
+    def __init__(self, strm=None):
+        """
+        Initialize the handler.
 
-    # extra data to be stored in ucmlogging, defined in dic{}
-    dic = {'clientip' : socket.gethostname()}
-    try:
-        f = open('/proc/' + str(os.getpid()) + '/cmdline', 'r')
-        pn = f.readline()
-        f.close()
-    except:
-        pn = None
-        f.close()
-    dic['psname'] = pn.replace('\000','#')[:-1]
-    
-    # set logfile
-    base_config = {
-        'logfile' : 'ucm.log',
-        'classify' : True,
-        'minpriority' : 10,
-        'viamail' : 0,
-        'mailaddr' : ''
-    }
-    
-    # rotate settings
-    rotate_config = {
-        'ro_rotateby' : 1,
-        'ro_backupcount' : 4,
-        'ro_maxsize' : 1024*1024*10,
-        'ro_when' : 'midnight',
-        'ro_interval' : 1,
-        'multiprocess' : 0
-    }
+        If strm is not specified, sys.stderr is used.
+        """
+        Handler.__init__(self)
+        if strm is None:
+            strm = sys.stderr
+        self.stream = strm
 
-    lock_dir = '.lock'
-    
-    if os.path.exists(lock_dir):
+    def flush(self):
+        """
+        Flushes the stream.
+        """
+        if self.stream and hasattr(self.stream, "flush"):
+            self.stream.flush()
+
+    def emit(self, record):
+        """
+        Emit a record.
+
+        If a formatter is specified, it is used to format the record.
+        The record is then written to the stream with a trailing newline.  If
+        exception information is present, it is formatted using
+        traceback.print_exception and appended to the stream.  If the stream
+        has an 'encoding' attribute, it is used to encode the message before
+        output to the stream.
+        """
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            # seek to the end of file
+            try:
+                stream.seek(0, os.SEEK_END)
+            except IOError, e:
+                pass
+            
+            fs = "%s\n"
+            if not hasattr(types, "UnicodeType"): #if no unicode support...
+                stream.write(fs % msg)
+            else:
+                try:
+                    if (isinstance(msg, unicode) and
+                        getattr(stream, 'encoding', None)):
+                        fs = fs.decode(stream.encoding)
+                        try:
+                            stream.write(fs % msg)
+                        except UnicodeEncodeError:
+                            #Printing to terminals sometimes fails. For example,
+                            #with an encoding of 'cp1251', the above write will
+                            #work if written to a stream opened or wrapped by
+                            #the codecs module, but fail when writing to a
+                            #terminal even when the codepage is set to cp1251.
+                            #An extra encoding step seems to be needed.
+                            stream.write((fs % msg).encode(stream.encoding))
+                    else:
+                        stream.write(fs % msg)
+                except UnicodeError:
+                    stream.write(fs % msg.encode("UTF-8"))
+            self.flush()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
+
+class FileHandler_MP(StreamHandler_MP):
+    """
+    A handler class which writes formatted logging records to disk files.
+    """
+    def __init__(self, filename, mode='a', encoding=None, delay=0):
+        """
+        Open the specified file and use it as the stream for logging.
+        """
+        #keep the absolute path, otherwise derived classes which use this
+        #may come a cropper when the current directory changes
+        if codecs is None:
+            encoding = None
+        self.baseFilename = os.path.abspath(filename)
+        self.mode = mode
+        self.encoding = encoding
+        if delay:
+            #We don't open the stream, but we still need to call the
+            #Handler constructor to set level, formatter, lock etc.
+            Handler.__init__(self)
+            self.stream = None
+        else:
+            StreamHandler_MP.__init__(self, self._open())
+
+    def close(self):
+        """
+        Closes the stream.
+        """
+        if self.stream:
+            self.flush()
+            if hasattr(self.stream, "close"):
+                self.stream.close()
+            StreamHandler_MP.close(self)
+            self.stream = None
+
+    def _open(self):
+        """
+        Open the current base file with the (original) mode and encoding.
+        Return the resulting stream.
+        """
+        if self.encoding is None:
+            stream = open(self.baseFilename, self.mode)
+        else:
+            stream = codecs.open(self.baseFilename, self.mode, self.encoding)
+        return stream
+
+    def emit(self, record):
+        """
+        Emit a record.
+
+        If the stream was not opened because 'delay' was specified in the
+        constructor, open it before calling the superclass's emit.
+        """
+        if self.stream is None:
+            self.stream = self._open()
+        StreamHandler_MP.emit(self, record)
+
+
+class RotatingFileHandler_MP(FileHandler_MP):
+    """
+    Handler for logging to a set of files, which switches from one file
+    to the next when the current file reaches a certain size.
+    """
+    _lock_dir = '.lock'
+    if os.path.exists(_lock_dir):
         pass
     else:
-        os.mkdir(lock_dir)
+        os.mkdir(_lock_dir)
+    
+    def __init__(self, filename, mode='a', maxBytes=0, backupCount=0, encoding=None, delay=0):
+        """
+        Open the specified file and use it as the stream for logging.
 
-    def __init__(self):
-        #self.logdir = './' + os.path.dirname(inspect.stack()[2][1]) + '/log'
-        self.logdir = os.getcwd() + '/log'
+        By default, the file grows indefinitely. You can specify particular
+        values of maxBytes and backupCount to allow the file to rollover at
+        a predetermined size.
 
-    def validate_base_config(self):
-        if not isinstance(self.base_config['logfile'], str):
-            raise TypeError('logfile: parameter is not str')
-        if not isinstance(self.base_config['classify'], bool):
-            raise TypeError('classify: parameter is not bool')
-        if self.base_config['minpriority'] not in (10, 20, 30, 40, 50):
-            raise ValueError('minpriority: parameter is not valid')
-        if not isinstance(self.base_config['viamail'] , int):
-            raise ValueError('viamail: parameter is not int')
-        if not isinstance(self.base_config['mailaddr'], str):
-            raise ValueError('mailaddr: parameter is not str')
-        
-    def validate_rotate_config(self):
-        if self.rotate_config['ro_rotateby'] not in (1, 2):
-            raise ValueError('ro_rotateby: value is not valid')
+        Rollover occurs whenever the current log file is nearly maxBytes in
+        length. If backupCount is >= 1, the system will successively create
+        new files with the same pathname as the base file, but with extensions
+        ".1", ".2" etc. appended to it. For example, with a backupCount of 5
+        and a base file name of "app.log", you would get "app.log",
+        "app.log.1", "app.log.2", ... through to "app.log.5". The file being
+        written to is always "app.log" - when it gets filled up, it is closed
+        and renamed to "app.log.1", and if files "app.log.1", "app.log.2" etc.
+        exist, then they are renamed to "app.log.2", "app.log.3" etc.
+        respectively.
 
-        if not isinstance(self.rotate_config['ro_backupcount'], int):
-            raise TypeError('ro_backupcount: parameter is not int')
+        If maxBytes is zero, rollover never occurs.
+        """
+        if maxBytes > 0:
+            mode = 'a' # doesn't make sense otherwise!
+        FileHandler_MP.__init__(self, filename, mode, encoding, delay)
+        self.mode = mode
+        self.encoding = encoding
+        self.maxBytes = maxBytes
+        self.backupCount = backupCount
 
-        if self.rotate_config['ro_backupcount'] <= 0:
-            raise ValueError('ro_backupcount: should not lower than or equal to zero')
-            
-        if not (isinstance(self.rotate_config['ro_maxsize'], int) or isinstance(self.rotate_config['ro_maxsize'], float)):
-            raise TypeError('ro_maxsize: parameter is neither int nor float')
+    def doRollover(self):
+        """
+        Do a rollover, as described in __init__().
+        """
 
-        if self.rotate_config['ro_maxsize'] <= 0:
-            raise ValueError('ro_maxsize: should not lower than or equal to zero')
+        self.stream.close()
+        if self.backupCount > 0:
+            for i in range(self.backupCount - 1, 0, -1):
+                sfn = "%s.%d" % (self.baseFilename, i)
+                dfn = "%s.%d" % (self.baseFilename, i + 1)
+                if os.path.exists(sfn):
+                    #print "%s -> %s" % (sfn, dfn)
+                    if os.path.exists(dfn):
+                        os.remove(dfn)
+                    #os.rename(sfn, dfn)
+                    shutil.copy(sfn, dfn)
+            dfn = self.baseFilename + ".1"
+            if os.path.exists(dfn):
+                os.remove(dfn)
+            #os.rename(self.baseFilename, dfn)
+            if os.path.exists(self.baseFilename):
+                shutil.copy(self.baseFilename, dfn)
+            #print "%s -> %s" % (self.baseFilename, dfn)
+        self.mode = 'w'
+        self.stream = self._open()
+        #self.stream.truncate(0)
 
-        # 'S' Secondes; 'M' Minutes; 'H' Hours; 'D' Days; 'W' Week day(0=Monday); 'midnight' roll over at midnight
-        #if self.rotate_config['ro_when'] not in ('S', 'M', 'H', 'D', 'W', 'MIDNIGHT'):
-        #    raise ValueError('ro_when: is not in (S, M, H, D, W, midnight)')
-        # only support form "M, H, midnight", modified by chenweiguo @20111230 for python 2.6.5 logging module rotate
-        if self.rotate_config['ro_when'] not in ('M', 'H', 'MIDNIGHT'):
-            raise ValueError('ro_when: is not in (M, H, midnight)')
+    def shouldRollover(self, record):
+        """
+        Determine if rollover should occur.
 
-        if not isinstance(self.rotate_config['ro_interval'], int):
-            raise TypeError('ro_interval: parameter is not int')
+        Basically, see if the supplied record would cause the file to exceed
+        the size limit we have.
+        """
+        if self.stream is None:                 # delay was set...
+            self.stream = self._open()
+        if self.maxBytes > 0:                   # are we rolling over?
+            msg = "%s\n" % self.format(record)
+            self.stream.seek(0, 2)  #due to non-posix-compliant Windows feature
+            if self.stream.tell() + len(msg) >= self.maxBytes:
+                return 1
+        return 0
+    
+    def emit(self, record):
+        """
+        Emit a record.
 
-        if self.rotate_config['ro_interval'] <= 0:
-            raise ValueError('ro_interval: should not lower than or equal to zero')
-        
-        if not isinstance(self.rotate_config['multiprocess'], int):
-            raise ValueError('multiprocess: parameter is not int')
-        
-        if self.rotate_config['multiprocess'] < 0:
-            raise ValueError('multiprocess: should not lower than zero')
-
-    def setConfig(self,
-                    module_name='',
-                    ro_rotateby=1,
-                    ro_backupcount=4,
-                    ro_maxsize=1024*1024*10,
-                    ro_when='midnight',
-                    ro_interval=1,
-                    logfile='ucm.log',
-                    classify=True,
-                    minpriority=10,
-                    multiprocess=0,
-                    viamail=0,
-                    mailaddr=''):
-                    
-        if not isinstance(module_name, str):
-            raise TypeError('module_name: parameter is not str')
-        self.dic['module_name'] = module_name
-
-        #### set the rotate configuration
-        self.rotate_config['ro_rotateby'] = ro_rotateby # 1 by file size; 2 by date
-        self.rotate_config['ro_backupcount'] = ro_backupcount
-        self.rotate_config['ro_maxsize'] = ro_maxsize
-        # You can use the when to specify the type of interval.
-        # 'S' Secondes; 'M' Minutes; 'H' Hours; 'D' Days; 'W' Week day(0=Monday); 'midnight' roll over at midnight
-        self.rotate_config['ro_when'] = ro_when.upper()
-        self.rotate_config['ro_interval'] = ro_interval
-        
-        self.rotate_config['multiprocess'] = multiprocess
-        
-        self.validate_rotate_config()
-        handlers.setRotate(self.rotate_config)
-
-        self.base_config['logfile'] = logfile
-        self.base_config['classify'] = classify
-        self.base_config['minpriority'] = minpriority
-        self.base_config['viamail'] = viamail
-        self.base_config['mailaddr'] = mailaddr
-        
-        self.validate_base_config()
-
-        self.restart()
-
-    # start configuration
-    def start(self):
-        if os.path.exists(self.logdir):
-            if os.path.isfile(self.logdir): 
-                raise Exception('log is a file, not a directory!')
-        else:   
-            os.mkdir(self.logdir)
-        
+        Output the record to the file, catering for rollover as described
+        in doRollover().
+        """
         try:
-            # formating file names
-            filename = self.logdir + '/' + self.base_config['logfile']
-            dot = filename.find('.log')
-            if dot == -1:
-                filename = filename + '.log'
-                dot = filename.find('.log')
-                
-            # prepare rotating handlers
-            fmt_rf = logging.Formatter(fmt='%(levelname)s: %(asctime)s: %(module_name)s %(psname)s %(process)d [%(clientip)s] [%(fname)s:%(lnumber)dL] %(message)s',datefmt='%m-%d %H:%M:%S')
-
-            if self.base_config['classify']:
-                for LEVEL in self.level_list:
-                    self.handler_list[LEVEL] = getRotatingHandler('%s_%s%s' % (filename[:dot], LEVEL, filename[dot:]))
-                    self.handler_list[LEVEL].setLevel(eval('logging.'+LEVEL.upper()))
-                    self.handler_list[LEVEL].setFormatter(fmt_rf)
-                    self.logger_list[LEVEL].addHandler(self.handler_list[LEVEL])
-            else:
-                for LEVEL in self.level_list:
-                    level_num = eval('logging.'+LEVEL.upper())
-                    if level_num <= 30:
-                        self.handler_list[LEVEL] = getRotatingHandler('%s_%s%s' % (filename[:dot], '_warning', filename[dot:]))
-                        self.handler_list[LEVEL].setLevel(level_num)
-                    else:
-                        self.handler_list[LEVEL] = getRotatingHandler('%s_%s%s' % (filename[:dot], '_critical', filename[dot:]))
-                        self.handler_list[LEVEL].setLevel(level_num)
-                    self.handler_list[LEVEL].setFormatter(fmt_rf)
-                    self.logger_list[LEVEL].addHandler(self.handler_list[LEVEL])
-                            
-            # Mail Handler
-            if self.base_config['viamail'] > 0:
-                self.mail_handler = MailHandler(self.base_config['mailaddr'])
-                self.mail_handler.setFormatter(fmt_rf)
-                self.logger_list['critical'].addHandler(self.mail_handler)
-            
-            # set the log level
-            for LEVEL in self.level_list:
-                self.logger_list[LEVEL].setLevel(self.base_config['minpriority'])
-                
-        except Exception, e:
-            traceback.print_exc()
-            raise e
+            if self.shouldRollover(record):
+                self.doRollover()
+            FileLock = self._lock_dir + '/' + os.path.basename(self.baseFilename) + '.' + record.levelname
+            f = open(FileLock, "w+")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            FileHandler_MP.emit(self, record)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
     
-    # stop configuration
-    def stop(self):
-        for LEVEL in self.level_list:
-            tmp_lists = self.logger_list[LEVEL].handlers[:]
-            for hdlr in tmp_lists:
-                self.logger_list[LEVEL].removeHandler(hdlr)
         
-        for key in self.handler_list.keys():
-            self.handler_list[key].close()
-        self.handler_list = {}
+class TimedRotatingFileHandler_MP(FileHandler_MP):
+    """
+    Handler for logging to a file, rotating the log file at certain timed
+    intervals.
 
-
-    def restart(self):
-        lock_config.acquire()
-        self.stop()
-        self.start()
-        lock_config.release()
+    If backupCount is > 0, when rollover is done, no more than backupCount
+    files are kept - the oldest ones are deleted.
+    """
+    _lock_dir = '.lock'
+    if os.path.exists(_lock_dir):
+        pass
+    else:
+        os.mkdir(_lock_dir)
     
-    def debug(self, msg, *args, **kwargs):
-        st = inspect.stack()[1]
-        try:                
-            dic = self.dic.copy()
-            dic['lnumber'] = st[2]
-            dic['fname'] = st[1]
-            for i in args:
-                msg += ' ' + str(i)
-            if self.rotate_config['multiprocess'] != 0:
-                f = open(LOCKFILE_DEBUG, "w+")
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                
-            self.logger_list['debug'].debug(msg , extra=dic)
-            
-            if self.rotate_config['multiprocess'] != 0:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                f.close()
-        except Exception as e:
-            raise Exception('error while logging')
+    def __init__(self, filename, when='h', interval=1, backupCount=0, encoding=None, delay=0, utc=0):
+        FileHandler_MP.__init__(self, filename, 'a', encoding, delay)
+        self.mode = mode
+        self.encoding = encoding
+        self.when = string.upper(when)
+        self.backupCount = backupCount
+        self.utc = utc
+        # Calculate the real rollover interval, which is just the number of
+        # seconds between rollovers.  Also set the filename suffix used when
+        # a rollover occurs.  Current 'when' events supported:
+        # S - Seconds
+        # M - Minutes
+        # H - Hours
+        # D - Days
+        # midnight - roll over at midnight
+        # W{0-6} - roll over on a certain day; 0 - Monday
+        #
+        # Case of the 'when' specifier is not important; lower or upper case
+        # will work.
+        currentTime = int(time.time())
+        if self.when == 'S':
+            self.interval = 1 # one second
+            self.suffix = "%Y-%m-%d_%H-%M-%S"
+            self.extMatch = r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$"
+        elif self.when == 'M':
+            self.interval = 60 # one minute
+            self.suffix = "%Y-%m-%d_%H-%M"
+            self.extMatch = r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$"
+        elif self.when == 'H':
+            self.interval = 60 * 60 # one hour
+            self.suffix = "%Y-%m-%d_%H"
+            self.extMatch = r"^\d{4}-\d{2}-\d{2}_\d{2}$"
+        elif self.when == 'D' or self.when == 'MIDNIGHT':
+            self.interval = 60 * 60 * 24 # one day
+            self.suffix = "%Y-%m-%d"
+            self.extMatch = r"^\d{4}-\d{2}-\d{2}$"
+        elif self.when.startswith('W'):
+            self.interval = 60 * 60 * 24 * 7 # one week
+            if len(self.when) != 2:
+                raise ValueError("You must specify a day for weekly rollover from 0 to 6 (0 is Monday): %s" % self.when)
+            if self.when[1] < '0' or self.when[1] > '6':
+                raise ValueError("Invalid day specified for weekly rollover: %s" % self.when)
+            self.dayOfWeek = int(self.when[1])
+            self.suffix = "%Y-%m-%d"
+            self.extMatch = r"^\d{4}-\d{2}-\d{2}$"
+        else:
+            raise ValueError("Invalid rollover interval specified: %s" % self.when)
 
-    def info(self, msg, *args, **kwargs):
-        st = inspect.stack()[1]
-        try:                
-            dic = self.dic.copy()
-            dic['lnumber'] = st[2]
-            dic['fname'] = st[1]
-            for i in args:
-                msg += ' ' + str(i)
-            if self.rotate_config['multiprocess'] != 0:
-                f = open(LOCKFILE_INFO, "w+")
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                
-            self.logger_list['info'].info(msg , extra=dic)
-            
-            if self.rotate_config['multiprocess'] != 0:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                f.close()
-        except Exception as e:
-            raise Exception('error while logging')
+        self.extMatch = re.compile(self.extMatch)
+        self.interval = self.interval * interval # multiply by units requested
+        self.rolloverAt = self.computeRollover(int(time.time()))
+
+        #print "Will rollover at %d, %d seconds from now" % (self.rolloverAt, self.rolloverAt - currentTime)
+
+    def computeRollover(self, currentTime):
+        """
+        Work out the rollover time based on the specified time.
+        """
+        result = currentTime + self.interval
+        # If we are rolling over at midnight or weekly, then the interval is already known.
+        # What we need to figure out is WHEN the next interval is.  In other words,
+        # if you are rolling over at midnight, then your base interval is 1 day,
+        # but you want to start that one day clock at midnight, not now.  So, we
+        # have to fudge the rolloverAt value in order to trigger the first rollover
+        # at the right time.  After that, the regular interval will take care of
+        # the rest.  Note that this code doesn't care about leap seconds. :)
+        if self.when == 'MIDNIGHT' or self.when.startswith('W'):
+            # This could be done with less code, but I wanted it to be clear
+            if self.utc:
+                t = time.gmtime(currentTime)
+            else:
+                t = time.localtime(currentTime)
+            currentHour = t[3]
+            currentMinute = t[4]
+            currentSecond = t[5]
+            # r is the number of seconds left between now and midnight
+            r = _MIDNIGHT - ((currentHour * 60 + currentMinute) * 60 +
+                    currentSecond)
+            result = currentTime + r
+            # If we are rolling over on a certain day, add in the number of days until
+            # the next rollover, but offset by 1 since we just calculated the time
+            # until the next day starts.  There are three cases:
+            # Case 1) The day to rollover is today; in this case, do nothing
+            # Case 2) The day to rollover is further in the interval (i.e., today is
+            #         day 2 (Wednesday) and rollover is on day 6 (Sunday).  Days to
+            #         next rollover is simply 6 - 2 - 1, or 3.
+            # Case 3) The day to rollover is behind us in the interval (i.e., today
+            #         is day 5 (Saturday) and rollover is on day 3 (Thursday).
+            #         Days to rollover is 6 - 5 + 3, or 4.  In this case, it's the
+            #         number of days left in the current week (1) plus the number
+            #         of days in the next week until the rollover day (3).
+            # The calculations described in 2) and 3) above need to have a day added.
+            # This is because the above time calculation takes us to midnight on this
+            # day, i.e. the start of the next day.
+            if self.when.startswith('W'):
+                day = t[6] # 0 is Monday
+                if day != self.dayOfWeek:
+                    if day < self.dayOfWeek:
+                        daysToWait = self.dayOfWeek - day
+                    else:
+                        daysToWait = 6 - day + self.dayOfWeek + 1
+                    newRolloverAt = result + (daysToWait * (60 * 60 * 24))
+                    if not self.utc:
+                        dstNow = t[-1]
+                        dstAtRollover = time.localtime(newRolloverAt)[-1]
+                        if dstNow != dstAtRollover:
+                            if not dstNow:  # DST kicks in before next rollover, so we need to deduct an hour
+                                newRolloverAt = newRolloverAt - 3600
+                            else:           # DST bows out before next rollover, so we need to add an hour
+                                newRolloverAt = newRolloverAt + 3600
+                    result = newRolloverAt
+        return result
+
+    def shouldRollover(self, record):
+        """
+        Determine if rollover should occur.
+
+        record is not used, as we are just comparing times, but it is needed so
+        the method signatures are the same
+        """
+        if not os.path.exists(self.baseFilename):
+            #print "file don't exist"  
+            return 0 
+        
+        cTime = time.localtime(time.time()) 
+        mTime = time.localtime(os.stat(self.baseFilename)[ST_MTIME])
+        if self.when == 'M' and cTime[4] != mTime[4]:  
+            #print "cTime:", cTime[4], "mTime:", mTime[4]   
+            return 1  
+        elif self.when == 'H' and cTime[3] != mTime[3]: 
+            #print "cTime:", cTime[3], "mTime:", mTime[3]   
+            return 1    
+        elif self.when == 'MIDNIGHT' and cTime[2] != mTime[2]:
+            #print "cTime:", cTime[2], "mTime:", mTime[2]   
+            return 1 
+        else:  
+            return 0 
+
+        t = int(time.time())
+        if t >= self.rolloverAt:
+            return 1
+        #print "No need to rollover: %d, %d" % (t, self.rolloverAt)
+        return 0
     
-    def warning(self, msg, *args, **kwargs):
-        st = inspect.stack()[1]
-        try:                
-            dic = self.dic.copy()
-            dic['lnumber'] = st[2]
-            dic['fname'] = st[1]
-            for i in args:
-                msg += ' ' + str(i)
-            if self.rotate_config['multiprocess'] != 0:
-                f = open(LOCKFILE_WARNING, "w+")
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                
-            self.logger_list['warning'].warning(msg, extra=dic)
-            
-            if self.rotate_config['multiprocess'] != 0:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                f.close()
-        except Exception as e:
-            raise Exception('error while logging')
+    def getFilesToDelete(self):
+        """
+        Determine the files to delete when rolling over.
 
-    def error(self, msg, *args, **kwargs):
-        st = inspect.stack()[1]
-        try:                
-            dic = self.dic.copy()
-            dic['lnumber'] = st[2]
-            dic['fname'] = st[1]
-            for i in args:
-                msg += ' ' + str(i)
-            if self.rotate_config['multiprocess'] != 0:
-                f = open(LOCKFILE_ERROR, "w+")
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                
-            self.logger_list['error'].error(msg, extra=dic)
-            
-            if self.rotate_config['multiprocess'] != 0:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                f.close()
-        except Exception as e:
-            raise Exception('error while logging')
+        More specific than the earlier method, which just used glob.glob().
+        """
+        dirName, baseName = os.path.split(self.baseFilename)
+        fileNames = os.listdir(dirName)
+        result = []
+        prefix = baseName + "."
+        plen = len(prefix)
+        for fileName in fileNames:
+            if fileName[:plen] == prefix:
+                suffix = fileName[plen:]
+                if self.extMatch.match(suffix):
+                    result.append(os.path.join(dirName, fileName))
+        result.sort()
+        if len(result) < self.backupCount:
+            result = []
+        else:
+            result = result[:len(result) - self.backupCount]
+        return result
 
-    def exception(self, msg, *args, **kwargs):
-        try:    
-            ei = sys.exc_info()
-            sio = cStringIO.StringIO()
-            traceback.print_exception(ei[0], ei[1], ei[2], None, sio)
-            s = sio.getvalue()
-            sio.close()
-            ex = s.replace('\n',' ')
-        except Exception, e:
-            ex = 'log exception'
-        st = inspect.stack()[1]
-        try:                
-            dic = self.dic.copy()
-            dic['lnumber'] = st[2]
-            dic['fname'] = st[1]
-            for i in args:
-                msg += ' ' + str(i)
-            self.logger_list['error'].error(ex + " " + msg, extra=dic)
-        except Exception as e:
-            raise Exception('error while logging')
+    def doRollover(self):
+        """
+        do a rollover; in this case, a date/time stamp is appended to the filename
+        when the rollover happens.  However, you want the file to be named for the
+        start of the interval, not the current time.  If there is a backup count,
+        then we have to get a list of matching filenames, sort them and remove
+        the one with the oldest suffix.
+        """
+        if self.stream:
+            self.stream.close()
+        # get the time that this sequence started at and make it a TimeTuple
+        #t = self.rolloverAt - self.interval
+        t = int(time.time())
+        if self.utc:
+            timeTuple = time.gmtime(t)
+        else:
+            timeTuple = time.localtime(t)
+        dfn = self.baseFilename + "." + time.strftime(self.suffix, timeTuple)
+        if os.path.exists(dfn):
+            os.remove(dfn)
+        if os.path.exists(self.baseFilename):
+            shutil.copy(self.baseFilename, dfn)
+            #print "%s -> %s" % (self.baseFilename, dfn)
+            #os.rename(self.baseFilename, dfn)
+        if self.backupCount > 0:
+            # find the oldest log file and delete it
+            #s = glob.glob(self.baseFilename + ".20*")
+            #if len(s) > self.backupCount:
+            #    s.sort()
+            #    os.remove(s[0])
+            for s in self.getFilesToDelete():
+                os.remove(s)
+        self.mode = 'w'
+        self.stream = self._open()
+        #self.stream.truncate(0)
+        currentTime = int(time.time())
+        newRolloverAt = self.computeRollover(currentTime)
+        while newRolloverAt <= currentTime:
+            newRolloverAt = newRolloverAt + self.interval
+        #If DST changes and midnight or weekly rollover, adjust for this.
+        if (self.when == 'MIDNIGHT' or self.when.startswith('W')) and not self.utc:
+            dstNow = time.localtime(currentTime)[-1]
+            dstAtRollover = time.localtime(newRolloverAt)[-1]
+            if dstNow != dstAtRollover:
+                if not dstNow:  # DST kicks in before next rollover, so we need to deduct an hour
+                    newRolloverAt = newRolloverAt - 3600
+                else:           # DST bows out before next rollover, so we need to add an hour
+                    newRolloverAt = newRolloverAt + 3600
+        self.rolloverAt = newRolloverAt
+    
+    def emit(self, record):
+        """
+        Emit a record.
 
-    def critical(self, msg, *args, **kwargs):
-        st = inspect.stack()[1]
-        try:                
-            dic = self.dic.copy()
-            dic['lnumber'] = st[2]
-            dic['fname'] = st[1]
-            for i in args:
-                msg += ' ' + str(i)
-            if self.rotate_config['multiprocess'] != 0:
-                f = open(LOCKFILE_CRITICAL, "w+") 
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                
-            self.logger_list['critical'].critical(msg, extra=dic)
-            
-            if self.rotate_config['multiprocess'] != 0:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                f.close()
-        except Exception as e:
-            raise Exception('error while logging')
-
-log = ucmlogging()
-#log.setConfig(module_name='module_name')
-
-if __name__ == "__main__":
-
-    debug('hello world')
-    warning('hello world')
-    info('hello world')
-    error('hello world')
-    critical('hello world')
+        Output the record to the file, catering for rollover as described
+        in doRollover().
+        """
+        try:
+            if self.shouldRollover(record):
+                self.doRollover()
+            FileLock = self._lock_dir + '/' + os.path.basename(self.baseFilename) + '.' + record.levelname
+            f = open(FileLock, "w+")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            FileHandler_MP.emit(self, record)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
+        
