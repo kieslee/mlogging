@@ -1,126 +1,34 @@
-from logging import Handler
+from logging import Handler, StreamHandler, FileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import fcntl, time, os, codecs, string, re, types, cPickle, struct, shutil
 from stat import ST_DEV, ST_INO, ST_MTIME
 
 
-class StreamHandler_MP(Handler):
+class StreamHandler_MP(StreamHandler):
     """
     A handler class which writes logging records, appropriately formatted,
-    to a stream. Note that this class does not close the stream, as
-    sys.stdout or sys.stderr may be used.
+    to a stream. Use for multiprocess.
     """
-
-    def __init__(self, strm=None):
-        """
-        Initialize the handler.
-
-        If strm is not specified, sys.stderr is used.
-        """
-        Handler.__init__(self)
-        if strm is None:
-            strm = sys.stderr
-        self.stream = strm
-
-    def flush(self):
-        """
-        Flushes the stream.
-        """
-        if self.stream and hasattr(self.stream, "flush"):
-            self.stream.flush()
-
+    
     def emit(self, record):
         """
         Emit a record.
-
-        If a formatter is specified, it is used to format the record.
-        The record is then written to the stream with a trailing newline.  If
-        exception information is present, it is formatted using
-        traceback.print_exception and appended to the stream.  If the stream
-        has an 'encoding' attribute, it is used to encode the message before
-        output to the stream.
+            First seek the end of file for multiprocess to log to the same file
         """
         try:
-            msg = self.format(record)
-            stream = self.stream
-            # seek to the end of file
-            try:
-                stream.seek(0, os.SEEK_END)
-            except IOError, e:
-                pass
-            
-            fs = "%s\n"
-            if not hasattr(types, "UnicodeType"): #if no unicode support...
-                stream.write(fs % msg)
-            else:
-                try:
-                    if (isinstance(msg, unicode) and
-                        getattr(stream, 'encoding', None)):
-                        fs = fs.decode(stream.encoding)
-                        try:
-                            stream.write(fs % msg)
-                        except UnicodeEncodeError:
-                            #Printing to terminals sometimes fails. For example,
-                            #with an encoding of 'cp1251', the above write will
-                            #work if written to a stream opened or wrapped by
-                            #the codecs module, but fail when writing to a
-                            #terminal even when the codepage is set to cp1251.
-                            #An extra encoding step seems to be needed.
-                            stream.write((fs % msg).encode(stream.encoding))
-                    else:
-                        stream.write(fs % msg)
-                except UnicodeError:
-                    stream.write(fs % msg.encode("UTF-8"))
-            self.flush()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except:
-            self.handleError(record)
+            if hasattr(self.stream, "seek"):
+                self.stream.seek(0, os.SEEK_END)
+        except IOError, e:
+            pass
+        
+        StreamHandler.emit(self, record)
 
-class FileHandler_MP(StreamHandler_MP):
+
+class FileHandler_MP(FileHandler, StreamHandler_MP):
     """
-    A handler class which writes formatted logging records to disk files.
+    A handler class which writes formatted logging records to disk files 
+        for multiprocess
     """
-    def __init__(self, filename, mode='a', encoding=None, delay=0):
-        """
-        Open the specified file and use it as the stream for logging.
-        """
-        #keep the absolute path, otherwise derived classes which use this
-        #may come a cropper when the current directory changes
-        if codecs is None:
-            encoding = None
-        self.baseFilename = os.path.abspath(filename)
-        self.mode = mode
-        self.encoding = encoding
-        if delay:
-            #We don't open the stream, but we still need to call the
-            #Handler constructor to set level, formatter, lock etc.
-            Handler.__init__(self)
-            self.stream = None
-        else:
-            StreamHandler_MP.__init__(self, self._open())
-
-    def close(self):
-        """
-        Closes the stream.
-        """
-        if self.stream:
-            self.flush()
-            if hasattr(self.stream, "close"):
-                self.stream.close()
-            StreamHandler_MP.close(self)
-            self.stream = None
-
-    def _open(self):
-        """
-        Open the current base file with the (original) mode and encoding.
-        Return the resulting stream.
-        """
-        if self.encoding is None:
-            stream = open(self.baseFilename, self.mode)
-        else:
-            stream = codecs.open(self.baseFilename, self.mode, self.encoding)
-        return stream
-
     def emit(self, record):
         """
         Emit a record.
@@ -133,7 +41,7 @@ class FileHandler_MP(StreamHandler_MP):
         StreamHandler_MP.emit(self, record)
 
 
-class RotatingFileHandler_MP(FileHandler_MP):
+class RotatingFileHandler_MP(RotatingFileHandler, FileHandler_MP):
     """
     Handler for logging to a set of files, which switches from one file
     to the next when the current file reaches a certain size.
@@ -143,39 +51,11 @@ class RotatingFileHandler_MP(FileHandler_MP):
         pass
     else:
         os.mkdir(_lock_dir)
-    
-    def __init__(self, filename, mode='a', maxBytes=0, backupCount=0, encoding=None, delay=0):
-        """
-        Open the specified file and use it as the stream for logging.
-
-        By default, the file grows indefinitely. You can specify particular
-        values of maxBytes and backupCount to allow the file to rollover at
-        a predetermined size.
-
-        Rollover occurs whenever the current log file is nearly maxBytes in
-        length. If backupCount is >= 1, the system will successively create
-        new files with the same pathname as the base file, but with extensions
-        ".1", ".2" etc. appended to it. For example, with a backupCount of 5
-        and a base file name of "app.log", you would get "app.log",
-        "app.log.1", "app.log.2", ... through to "app.log.5". The file being
-        written to is always "app.log" - when it gets filled up, it is closed
-        and renamed to "app.log.1", and if files "app.log.1", "app.log.2" etc.
-        exist, then they are renamed to "app.log.2", "app.log.3" etc.
-        respectively.
-
-        If maxBytes is zero, rollover never occurs.
-        """
-        if maxBytes > 0:
-            mode = 'a' # doesn't make sense otherwise!
-        FileHandler_MP.__init__(self, filename, mode, encoding, delay)
-        self.mode = mode
-        self.encoding = encoding
-        self.maxBytes = maxBytes
-        self.backupCount = backupCount
 
     def doRollover(self):
         """
         Do a rollover, as described in __init__().
+        For multiprocess, we use shutil.copy instead of rename.
         """
 
         self.stream.close()
@@ -184,37 +64,17 @@ class RotatingFileHandler_MP(FileHandler_MP):
                 sfn = "%s.%d" % (self.baseFilename, i)
                 dfn = "%s.%d" % (self.baseFilename, i + 1)
                 if os.path.exists(sfn):
-                    #print "%s -> %s" % (sfn, dfn)
                     if os.path.exists(dfn):
                         os.remove(dfn)
-                    #os.rename(sfn, dfn)
                     shutil.copy(sfn, dfn)
             dfn = self.baseFilename + ".1"
             if os.path.exists(dfn):
                 os.remove(dfn)
-            #os.rename(self.baseFilename, dfn)
             if os.path.exists(self.baseFilename):
                 shutil.copy(self.baseFilename, dfn)
-            #print "%s -> %s" % (self.baseFilename, dfn)
         self.mode = 'w'
         self.stream = self._open()
-        #self.stream.truncate(0)
-
-    def shouldRollover(self, record):
-        """
-        Determine if rollover should occur.
-
-        Basically, see if the supplied record would cause the file to exceed
-        the size limit we have.
-        """
-        if self.stream is None:                 # delay was set...
-            self.stream = self._open()
-        if self.maxBytes > 0:                   # are we rolling over?
-            msg = "%s\n" % self.format(record)
-            self.stream.seek(0, 2)  #due to non-posix-compliant Windows feature
-            if self.stream.tell() + len(msg) >= self.maxBytes:
-                return 1
-        return 0
+        
     
     def emit(self, record):
         """
@@ -222,6 +82,8 @@ class RotatingFileHandler_MP(FileHandler_MP):
 
         Output the record to the file, catering for rollover as described
         in doRollover().
+        
+        For multiprocess, we use file lock.
         """
         try:
             if self.shouldRollover(record):
