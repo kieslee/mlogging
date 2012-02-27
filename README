@@ -1,1 +1,26 @@
-hello git
+Introduction
+============
+mlogging provide an additional handlers for MultiProcess program based on logging module(Copyright 2001-2007 by Vinay Sajip)
+It provide two handlers : 
+	RotatingFileHandler_MP
+	TimedRotatingFileHandler_MP
+
+System requirements
+===================
+* Python version 2.6 or higher;
+* Linux
+	
+Installation
+============
+python setup.py install
+
+Example
+============
+from mlogging import RotatingFileHandler_MP
+
+my_logger = logging.getLogger('MyLogger')
+# Add the log message handler to the logger
+handler = RotatingFileHandler_MP(
+              LOG_FILENAME, maxBytes=200, backupCount=5)
+
+my_logger.addHandler(handler)
