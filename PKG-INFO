@@ -1,0 +1,10 @@
+Metadata-Version: 1.1
+Name: mlogging
+Version: 0.1
+Summary: additional logging handlers for multiprocess
+Home-page: https://github.com/kies/mlogging
+Author: Kies Lee
+Author-email: lleelm@gmail.com
+License: GPL
+Description: RotatingFileHandler_MP,TimedRotatingFileHandler_MP handlers for multiprocess
+Platform: Linux
