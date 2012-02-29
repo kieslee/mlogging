@@ -1,7 +1,7 @@
 Metadata-Version: 1.1
 Name: mlogging
 Version: 0.1
-Summary: additional logging handlers for multiprocess
+Summary: Rotating logging handlers for MultiProcess
 Home-page: https://github.com/kies/mlogging
 Author: Kies Lee
 Author-email: lleelm@gmail.com
